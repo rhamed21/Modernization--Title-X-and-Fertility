@@ -1,0 +1,4 @@
+Policy wave,Max absolute SMD before weighting,Max absolute SMD after weighting (never-treated controls),Covariates with |SMD| > 0.10 (never-treated controls),Max absolute SMD after weighting (not-yet-treated controls),Mean absolute SMD after weighting (not-yet-treated controls),Covariates with |SMD| > 0.10 (not-yet-treated controls),Covariates with |SMD| > 0.25 (not-yet-treated controls)
+Wave 1 (1965–67): EOA initial grants,0.824,0.596,11,0.852,0.119,6,1
+Wave 2 (1968–69): National emphasis,0.6,0.592,4,0.622,0.127,5,2
+Wave 3 (1970–73): Title X,0.901,0.657,1,0.983,0.158,8,2

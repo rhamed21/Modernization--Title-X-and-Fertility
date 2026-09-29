@@ -1,0 +1,177 @@
+---
+title: "Modernization of Title X Family Planning Analysis: Data Cleaning"
+author: "Roa'a Hamed"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+This document turns the original replication data into the analysis dataset
+`data/modernization_data.rds`. It is an R translation of the earlier Stata
+do-file (`modernization_datacleaning.do`), so Stata is not needed.
+
+**Inputs** (from Bailey's replication package; see `README.md`), placed in `data/`:
+
+- `vs_fo_final.dta`: county-year panel.
+- `table1data.dta`: county covariates. It has **no FIPS identifier**.
+
+**What it does**
+
+1. Recovers the unrounded 1960 baseline covariates. The panel only stores them as
+   detrended terms (`D_*_t` = baseline level x year), so dividing by `year` recovers them.
+2. Attaches FIPS codes to `table1data.dta` by matching its seven demographic
+   variables to the recovered 1960 values.
+3. Merges the extra covariates (1960 population, education, region) onto the full panel by FIPS.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+## Packages and file paths
+
+```{r config}
+required_pkgs <- c("haven", "dplyr", "purrr", "tibble")
+missing_pkgs <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(missing_pkgs) > 0) {
+  stop("Please install: ", paste(missing_pkgs, collapse = ", "), call. = FALSE)
+}
+
+library(haven)
+library(dplyr)
+library(purrr)
+library(tibble)
+
+data_dir        <- "data"
+raw_panel_file  <- file.path(data_dir, "vs_fo_final.dta")
+raw_table1_file <- file.path(data_dir, "table1data.dta")
+out_file        <- file.path(data_dir, "modernization_data.rds")
+
+input_files <- c(raw_panel_file, raw_table1_file)
+absent <- input_files[!file.exists(input_files)]
+if (length(absent) > 0) {
+  stop("Missing input file(s): ", paste(absent, collapse = ", "),
+       "\nDownload them from the replication package (see README.md) into ", data_dir, "/",
+       call. = FALSE)
+}
+
+# Detrended variables in the panel, and the baseline names they map to
+# e.g. D_60pcturban_t  ->  _60pcturban
+detrended_vars <- c(
+  "D_pct59incge10k_t", "D_pct59inclt3k_t", "D_60pctnonwhit_t", "D_60pctrurf_t",
+  "D_60pcturban_t", "D_60pctmt64years_t", "D_60pctlt5years_t"
+)
+baseline_vars <- sub("_t$", "", sub("^D_", "_", detrended_vars))
+
+# Covariates that exist only in table1data.dta
+extra_vars <- c("_60totpop", "_60pcteducge12yr", "_60pcteduclt4yr", "NE", "MW", "S", "W")
+
+# Stata's `gen` stores single-precision floats. Emulate that so results match the
+# original Stata output exactly.
+as_float32 <- function(x) {
+  x <- as.numeric(x)
+  out <- readBin(writeBin(x, raw(), size = 4), what = "numeric", n = length(x), size = 4)
+  out[is.na(x)] <- NA_real_
+  out
+}
+```
+
+## Step 1: Recover the unrounded baseline covariates
+
+```{r detrend}
+panel <- read_dta(raw_panel_file)
+stopifnot(all(detrended_vars %in% names(panel)))
+
+for (i in seq_along(detrended_vars)) {
+  panel[[baseline_vars[i]]] <- as_float32(
+    as.numeric(panel[[detrended_vars[i]]]) / as.numeric(panel[["year"]])
+  )
+}
+
+# The 1960 snapshot (one row per county) is the bridge that carries FIPS codes
+bridge <- panel %>%
+  filter(as.numeric(year) == 60) %>%
+  select(fips, all_of(baseline_vars))
+
+stopifnot(!anyNA(bridge[baseline_vars]), !anyDuplicated(bridge$fips))
+cat("Counties in 1960 bridge:", nrow(bridge), "\n")
+```
+
+## Step 2: Attach FIPS codes to `table1data.dta`
+
+Each `table1data` row is matched to the 1960 county whose seven baseline values are
+closest. The Stata version matched on these values rounded to three decimals; the
+tolerance below (0.0005) gives the same pairing without depending on how rounding
+behaves at exact boundaries. The code stops if any row lacks a match or if two rows
+match the same county, so a bad match cannot pass silently.
+
+```{r match-fips}
+table1 <- read_dta(raw_table1_file)
+stopifnot(all(c(baseline_vars, extra_vars) %in% names(table1)))
+
+B  <- sapply(bridge[baseline_vars], as.numeric)   # counties x 7 (from the panel)
+T1 <- sapply(table1[baseline_vars], as.numeric)   # counties x 7 (from table1data)
+stopifnot(!anyNA(T1))
+
+tol <- 5e-4
+
+# For each table1data row: index of the closest bridge row and the worst-case gap
+best <- vapply(seq_len(nrow(T1)), function(i) {
+  gap <- apply(abs(sweep(B, 2, T1[i, ], "-")), 1, max)
+  j <- which.min(gap)
+  c(j = as.numeric(j), dist = gap[j])
+}, FUN.VALUE = c(j = 0, dist = 0))
+
+match_tbl <- tibble(b_row = best["j", ], dist = best["dist", ])
+
+n_matched   <- sum(match_tbl$dist < tol)
+n_duplicate <- sum(duplicated(match_tbl$b_row))
+cat("table1data rows:", nrow(T1), "\n")
+cat("Matched within tolerance:", n_matched, "\n")
+cat("Rows matched to a county already used:", n_duplicate, "\n")
+
+if (n_matched != nrow(T1) || n_duplicate > 0 || nrow(T1) != nrow(bridge)) {
+  stop("FIPS matching failed: expected a one-to-one match of every county.", call. = FALSE)
+}
+
+covariates_to_add <- tibble(fips = bridge$fips[match_tbl$b_row]) %>%
+  bind_cols(table1[extra_vars])
+```
+
+## Step 3: Merge onto the full panel
+
+```{r merge}
+panel <- panel %>%
+  left_join(covariates_to_add, by = "fips", relationship = "many-to-one")
+
+stopifnot(all(panel$fips %in% covariates_to_add$fips))
+
+cat("Rows:", nrow(panel), "| Counties:", n_distinct(panel$fips), "\n")
+saveRDS(panel, out_file)
+cat("Saved", out_file, "\n")
+```
+
+## Optional check against the old Stata output
+
+If you also have the dataset made by the original Stata do-file, save it as
+`data/modernization_data.dta` and this chunk compares every added column. Otherwise
+it is skipped. Differences should be zero or on the order of floating-point error.
+
+```{r compare-stata, eval = file.exists(file.path("data", "modernization_data.dta"))}
+stata_version <- read_dta(file.path("data", "modernization_data.dta"))
+stopifnot(identical(as.numeric(stata_version$fips), as.numeric(panel$fips)),
+          identical(as.numeric(stata_version$year), as.numeric(panel$year)))
+
+map_dfr(c(baseline_vars, extra_vars), function(v) {
+  tibble(variable = v,
+         max_abs_diff = max(abs(as.numeric(panel[[v]]) - as.numeric(stata_version[[v]])),
+                            na.rm = TRUE))
+})
+```
+
+## Notes on the data
+
+- `NE`, `MW`, `S` and `W` are coded 0/100 rather than 0/1. The analysis treats any value above 0 as membership.
+- `_60pcteducge12yr` has a maximum above 100, which cannot be a percentage. It is carried through unchanged from the source data; check it before relying on that covariate.

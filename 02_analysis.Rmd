@@ -1,0 +1,906 @@
+---
+title: "Modernization of Title X Family Planning Analysis: Analysis"
+author: "Roa'a Hamed"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+This document estimates the effect of federally funded family planning programs
+on fertility using modern staggered-adoption difference-in-differences methods.
+It reads `data/modernization_data.rds`, which is created by `01_data_cleaning.Rmd`
+(run that first; see `README.md`).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, fig.width = 9, fig.height = 6)
+```
+
+## 0. Packages and settings
+
+```{r packages}
+# Stop early with a clear message if a required package is missing
+required_pkgs <- c("haven", "dplyr", "tidyr", "ggplot2", "fixest", "cobalt", "purrr",
+                   "stringr", "readr", "WeightIt", "did", "tibble", "knitr",
+                   "kableExtra", "broom", "gbm")  # gbm is needed by WeightIt(method = "gbm")
+missing_pkgs <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(missing_pkgs) > 0) {
+  stop("Please install: ", paste(missing_pkgs, collapse = ", "), call. = FALSE)
+}
+
+library(haven)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(fixest)
+library(cobalt)
+library(purrr)
+library(stringr)
+library(readr)
+library(WeightIt)
+library(did)
+library(tibble)
+library(knitr)
+library(kableExtra)
+library(broom)
+
+set.seed(123)
+```
+
+### Output folders
+
+```{r output-folders}
+data_dir <- "data"
+
+dir.create("report_outputs", showWarnings = FALSE)
+dir.create("report_outputs/csv", showWarnings = FALSE)
+dir.create("report_outputs/figures", showWarnings = FALSE)
+```
+
+### Labels and plot theme
+
+```{r labels-and-theme}
+wave_labels <- c(
+  "1965" = "Wave 1 (1965–67): EOA initial grants",
+  "1968" = "Wave 2 (1968–69): National emphasis",
+  "1970" = "Wave 3 (1970–73): Title X"
+)
+
+waves <- c(1965L, 1968L, 1970L)
+
+var_labels <- c(
+  gfr_trend_pre    = "Pre-treatment fertility trend (1959–1964)",
+  gfr_pre_mean     = "Pre-treatment fertility level (1959–1964, mean)",
+  pct59incge10k    = "Households with income $10,000+ (1959, %)",
+  pct59inclt3k     = "Households with income below $3,000 (1959, %)",
+  pct60nonwhit     = "Nonwhite population (1960, %)",
+  pct60rurf        = "Rural farm population (1960, %)",
+  pct60urban       = "Urban population (1960, %)",
+  pct60mt64years   = "Population age 65 or over (1960, %)", 
+  pct60lt5years    = "Children under age 5 (1960, %)", 
+  ln_60totpop      = "Total population (log)",
+  pct60educge12yr  = "Population with 12+ years of education (1960, %)",
+  pct60educlt4yr   = "Population with less than 4 years of education (1960, %)",
+  region_factor    = "Region"
+)
+
+theme_report <- function() {
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(face = "bold", size = 13),
+      plot.subtitle = element_text(size = 10, color = "grey30"),
+      plot.caption = element_text(size = 8, color = "grey40", hjust = 0),
+      axis.title = element_text(size = 11),
+      strip.text = element_text(face = "bold"),
+      legend.position = "bottom",
+      panel.grid.minor = element_blank()
+    )
+}
+```
+
+## 1. Load and clean the panel
+
+Reads the county-year panel produced by `01_data_cleaning.Rmd` and builds treatment-timing variables.
+
+```{r load-panel}
+panel_file <- file.path(data_dir, "modernization_data.rds")
+if (!file.exists(panel_file)) {
+  stop("Cannot find ", panel_file, ". Run 01_data_cleaning.Rmd first.", call. = FALSE)
+}
+
+df <- readRDS(file.path(data_dir, "modernization_data.rds")) %>%
+  mutate(
+    year = as.numeric(year),
+    year = ifelse(year < 100, year + 1900, year),
+    first_treat = as.numeric(fp_year_p74_fed),
+    first_treat = ifelse(is.na(first_treat), 0, first_treat),
+    first_treat = ifelse(first_treat > 0 & first_treat < 100, first_treat + 1900, first_treat),
+    ever_treated = as.integer(first_treat > 0),
+    county_id = as.numeric(fips)
+  )
+```
+
+## 2. County-level baseline data
+
+### Pre-treatment fertility moments (1959-1964)
+
+```{r pretreatment-fertility}
+pre_panel <- df %>%
+  filter(year >= 1959, year <= 1964) %>%
+  select(county_id, year, gfr_nonint)
+
+trend_df <- pre_panel %>%
+  group_by(county_id) %>%
+  summarise(
+    n_gfr = sum(!is.na(gfr_nonint)),
+    gfr_trend_pre = if (n_gfr[1] >= 2) {
+      coef(lm(gfr_nonint ~ year,
+              data = data.frame(year = year, gfr_nonint = gfr_nonint)))[["year"]]
+    } else {
+      NA_real_
+    },
+    gfr_pre_mean = mean(gfr_nonint, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+### County baseline file
+
+One row per county: 1960 covariates, pre-trend, and policy wave.
+
+```{r county-baseline}
+baseline_vars <- c(
+  "_pct59incge10k", "_pct59inclt3k",
+  "_60pctnonwhit", "_60pctrurf", "_60pcturban",
+  "_60pctmt64years", "_60pctlt5years", "_60totpop",
+  "_60pcteducge12yr", "_60pcteduclt4yr",
+  "NE", "MW", "S", "W"
+)
+baseline_vars <- baseline_vars[baseline_vars %in% names(df)]
+
+county_base_raw <- df %>%
+  group_by(county_id) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(has_1960 = any(year == 1960)) %>%
+  filter(if_else(has_1960, year == 1960, row_number() == 1)) %>%
+  slice(1) %>%
+  ungroup()
+
+county_base <- county_base_raw %>%
+  select(county_id, first_treat, ever_treated, all_of(baseline_vars)) %>%
+  left_join(trend_df, by = "county_id") %>%
+  mutate(
+    ln_60totpop = log(`_60totpop`)
+  ) %>%
+  rename(
+    pct59incge10k   = `_pct59incge10k`,
+    pct59inclt3k    = `_pct59inclt3k`,
+    pct60nonwhit    = `_60pctnonwhit`,
+    pct60rurf       = `_60pctrurf`,
+    pct60urban      = `_60pcturban`,
+    pct60mt64years  = `_60pctmt64years`,
+    pct60lt5years   = `_60pctlt5years`,
+    pct60educge12yr = `_60pcteducge12yr`,
+    pct60educlt4yr  = `_60pcteduclt4yr`
+  ) %>%
+  filter(
+    !is.na(gfr_trend_pre), !is.na(gfr_pre_mean),
+    !is.na(pct59incge10k), !is.na(pct59inclt3k),
+    !is.na(pct60nonwhit), !is.na(pct60rurf), !is.na(pct60urban),
+    !is.na(pct60mt64years), !is.na(pct60lt5years),
+    !is.na(ln_60totpop), !is.na(pct60educge12yr), !is.na(pct60educlt4yr)
+  ) %>%
+  mutate(
+    region_NE = as.integer(as.numeric(NE) > 0),
+    region_MW = as.integer(as.numeric(MW) > 0),
+    region_S  = as.integer(as.numeric(S) > 0),
+    region_W  = as.integer(as.numeric(W) > 0),
+    region_factor = case_when(
+      region_NE == 1 ~ "NE",
+      region_MW == 1 ~ "MW",
+      region_S  == 1 ~ "S",
+      TRUE           ~ "W"
+    ),
+    region_factor = factor(region_factor, levels = c("W", "NE", "MW", "S")),
+    wave = case_when(
+      first_treat == 0                           ~ 0,
+      first_treat >= 1965 & first_treat <= 1967 ~ 1965,
+      first_treat >= 1968 & first_treat <= 1969 ~ 1968,
+      first_treat >= 1970 & first_treat <= 1973 ~ 1970,
+      TRUE ~ NA_real_
+    )
+  )
+```
+
+### Covariate set and propensity score formula
+
+```{r covariate-set}
+covariates <- c(
+  "gfr_trend_pre", "gfr_pre_mean",
+  "pct59incge10k", "pct59inclt3k",
+  "pct60nonwhit", "pct60rurf", "pct60urban",
+  "pct60mt64years", "pct60lt5years",
+  "ln_60totpop", "pct60educge12yr", "pct60educlt4yr",
+  "region_factor"
+)
+
+ps_formula <- reformulate(covariates, response = "treated_g")
+```
+
+### Helper: build risk set
+
+```{r helper-risk-set}
+make_risk_set <- function(base_df, g) {
+  base_df %>%
+    filter(wave == g | wave > g | wave == 0) %>%
+    mutate(
+      treated_g = as.integer(wave == g),
+      control_type = case_when(
+        wave == 0 ~ "Never treated",
+        wave > g  ~ "Not yet treated",
+        wave == g ~ "Treated"
+      )
+    )
+}
+```
+
+## 3. Propensity score weighting and balance
+
+### Never-treated controls
+
+```{r weighting-never-treated}
+never_bal_objects <- list()
+never_weights_list <- list()
+never_balance_results <- list()
+
+for (g in waves) {
+  df_g_never <- county_base %>%
+    filter(wave == g | wave == 0) %>%
+    mutate(treated_g = as.integer(wave == g))
+
+  w_init_never <- weightit(
+    formula = ps_formula,
+    data = df_g_never,
+    method = "gbm",
+    estimand = "ATT",
+    stop.method = "es.mean",
+    interaction.depth = 1,
+    shrinkage = 0.001,
+    n.trees = 10000,
+    bag.fraction = 1
+  )
+
+  df_g_never <- df_g_never %>%
+    mutate(ps_init = w_init_never$ps)
+
+  lower <- max(
+    quantile(df_g_never$ps_init[df_g_never$treated_g == 1], 0.10, na.rm = TRUE),
+    quantile(df_g_never$ps_init[df_g_never$treated_g == 0], 0.10, na.rm = TRUE)
+  )
+
+  upper <- min(
+    quantile(df_g_never$ps_init[df_g_never$treated_g == 1], 0.90, na.rm = TRUE),
+    quantile(df_g_never$ps_init[df_g_never$treated_g == 0], 0.90, na.rm = TRUE)
+  )
+
+  df_g_never_trim <- df_g_never %>%
+    filter(ps_init >= lower, ps_init <= upper)
+
+  w_final_never <- weightit(
+    formula = ps_formula,
+    data = df_g_never_trim,
+    method = "gbm",
+    estimand = "ATT",
+    stop.method = "es.mean",
+    interaction.depth = 1,
+    shrinkage = 0.001,
+    n.trees = 10000,
+    bag.fraction = 1
+  )
+
+  w_final_never <- trim(w_final_never, at = 0.99)
+  never_bal_objects[[as.character(g)]] <- w_final_never
+
+  bt <- bal.tab(w_final_never, un = TRUE, binary = "std")$Balance
+
+  never_balance_results[[as.character(g)]] <- bt %>%
+    tibble::rownames_to_column("covariate") %>%
+    mutate(
+      wave = g,
+      wave_label = wave_labels[as.character(g)]
+    ) %>%
+    select(wave, wave_label, covariate, Diff.Un, Diff.Adj)
+
+  never_weights_list[[as.character(g)]] <- df_g_never_trim %>%
+    mutate(
+      stack_wave = g,
+      treated_stack = treated_g,
+      ipw_weight_gbm = w_final_never$weights
+    )
+}
+
+never_balance_tbl <- bind_rows(never_balance_results)
+
+never_balance_summary <- never_balance_tbl %>%
+  group_by(wave, wave_label) %>%
+  summarise(
+    max_abs_smd_unadj = max(abs(Diff.Un), na.rm = TRUE),
+    max_abs_smd_adj = max(abs(Diff.Adj), na.rm = TRUE),
+    n_bad_010_adj = sum(abs(Diff.Adj) > 0.10, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(never_balance_summary, "report_outputs/csv/diag_never_treated_balance_summary.csv")
+```
+
+### Not-yet-treated controls with GBM tuning
+
+This is the slowest step: it fits a grid of GBM models for each policy wave.
+
+```{r weighting-not-yet-treated}
+gbm_grid <- tidyr::expand_grid(
+  interaction.depth = c(1, 2),
+  shrinkage = c(0.001, 0.003),
+  n.trees = c(10000, 20000),
+  bag.fraction = c(0.75, 1.0)
+)
+
+stack_weights_list <- list()
+stack_bal_objects <- list()
+gbm_tuning_list <- list()
+overlap_summary <- list()
+
+for (g in waves) {
+  df_g <- make_risk_set(county_base, g)
+
+  w_init <- weightit(
+    formula = ps_formula,
+    data = df_g,
+    method = "gbm",
+    estimand = "ATT",
+    stop.method = "es.mean",
+    interaction.depth = 1,
+    shrinkage = 0.001,
+    n.trees = 10000,
+    bag.fraction = 1
+  )
+
+  df_g <- df_g %>%
+    mutate(ps_init = w_init$ps)
+
+  lower <- max(
+    quantile(df_g$ps_init[df_g$treated_g == 1], 0.10, na.rm = TRUE),
+    quantile(df_g$ps_init[df_g$treated_g == 0], 0.10, na.rm = TRUE)
+  )
+
+  upper <- min(
+    quantile(df_g$ps_init[df_g$treated_g == 1], 0.90, na.rm = TRUE),
+    quantile(df_g$ps_init[df_g$treated_g == 0], 0.90, na.rm = TRUE)
+  )
+
+  df_g_trim <- df_g %>%
+    filter(ps_init >= 0.1, ps_init <= 0.9)
+
+  overlap_summary[[as.character(g)]] <- tibble(
+    wave = g,
+    wave_label = wave_labels[as.character(g)],
+    lower = lower,
+    upper = upper,
+    n_treated_before = sum(df_g$treated_g == 1),
+    n_control_before = sum(df_g$treated_g == 0),
+    n_treated_after = sum(df_g_trim$treated_g == 1),
+    n_control_after = sum(df_g_trim$treated_g == 0)
+  )
+
+  tune_results_g <- pmap_dfr(
+    gbm_grid,
+    function(interaction.depth, shrinkage, n.trees, bag.fraction) {
+      w_fit <- weightit(
+        formula = ps_formula,
+        data = df_g_trim,
+        method = "gbm",
+        estimand = "ATT",
+        stop.method = "es.mean",
+        interaction.depth = interaction.depth,
+        shrinkage = shrinkage,
+        n.trees = n.trees,
+        bag.fraction = bag.fraction
+      )
+
+      w_fit_trim <- trim(w_fit, at = 0.99)
+      bt <- bal.tab(w_fit_trim, un = TRUE, binary = "std")$Balance
+
+      tibble(
+        wave = g,
+        interaction.depth = interaction.depth,
+        shrinkage = shrinkage,
+        n.trees = n.trees,
+        bag.fraction = bag.fraction,
+        max_abs_smd = max(abs(bt$Diff.Adj), na.rm = TRUE),
+        mean_abs_smd = mean(abs(bt$Diff.Adj), na.rm = TRUE),
+        n_bad_010 = sum(abs(bt$Diff.Adj) > 0.10, na.rm = TRUE)
+      )
+    }
+  ) %>%
+    arrange(max_abs_smd, n_bad_010, mean_abs_smd)
+
+  gbm_tuning_list[[as.character(g)]] <- tune_results_g
+  best_g <- tune_results_g %>% slice(1)
+
+  w_final <- weightit(
+    formula = ps_formula,
+    data = df_g_trim,
+    method = "gbm",
+    estimand = "ATT",
+    stop.method = "es.mean",
+    interaction.depth = best_g$interaction.depth,
+    shrinkage = best_g$shrinkage,
+    n.trees = best_g$n.trees,
+    bag.fraction = best_g$bag.fraction
+  )
+
+  w_final <- trim(w_final, at = 0.99)
+  stack_bal_objects[[as.character(g)]] <- w_final
+
+  stack_weights_list[[as.character(g)]] <- df_g_trim %>%
+    mutate(
+      stack_wave = g,
+      treated_stack = treated_g,
+      ipw_weight_gbm = w_final$weights
+    )
+}
+```
+
+```{r balance-summary-not-yet-treated}
+gbm_tuning_results <- bind_rows(gbm_tuning_list)
+overlap_summary_tbl <- bind_rows(overlap_summary)
+
+write_csv(gbm_tuning_results, "report_outputs/csv/diag_gbm_tuning_results.csv")
+write_csv(overlap_summary_tbl, "report_outputs/csv/diag_overlap_summary.csv")
+
+balance_summary_nyt <- map_dfr(waves, function(g) {
+  bt <- bal.tab(
+    stack_bal_objects[[as.character(g)]],
+    un = TRUE,
+    binary = "std"
+  )$Balance
+
+  tibble(
+    wave = g,
+    wave_label = wave_labels[as.character(g)],
+    max_abs_smd = max(abs(bt$Diff.Adj), na.rm = TRUE),
+    mean_abs_smd = mean(abs(bt$Diff.Adj), na.rm = TRUE),
+    n_bad_010 = sum(abs(bt$Diff.Adj) > 0.10, na.rm = TRUE),
+    n_bad_025 = sum(abs(bt$Diff.Adj) > 0.25, na.rm = TRUE)
+  )
+})
+
+write_csv(balance_summary_nyt, "report_outputs/csv/diag_balance_summary_notyettreated.csv")
+```
+
+### Cohort comparability
+
+```{r cohort-comparability}
+cohort_compare <- county_base %>%
+  filter(wave %in% waves) %>%
+  group_by(wave) %>%
+  summarise(
+    mean_pretrend = mean(gfr_trend_pre, na.rm = TRUE),
+    mean_prelevel = mean(gfr_pre_mean, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+cohort_pretrend_reg <- lm(
+  gfr_trend_pre ~ factor(wave),
+  data = county_base %>% filter(wave %in% waves)
+)
+
+write_csv(cohort_compare, "report_outputs/csv/diag_cohort_pretrend_summary.csv")
+write_csv(broom::tidy(cohort_pretrend_reg), "report_outputs/csv/diag_cohort_pretrend_regression.csv")
+```
+
+## 4. Main estimates
+
+### Build the DiD panel
+
+```{r did-panel}
+df_clean <- df %>%
+  select(county_id, year, gfr_nonint, first_treat, ever_treated)
+
+did_covars <- county_base %>%
+  select(
+    county_id,
+    gfr_trend_pre, gfr_pre_mean,
+    pct59incge10k, pct59inclt3k,
+    pct60nonwhit, pct60rurf, pct60urban,
+    pct60mt64years, pct60lt5years,
+    ln_60totpop, pct60educge12yr, pct60educlt4yr,
+    region_factor
+  )
+
+did_panel <- df_clean %>%
+  left_join(did_covars, by = "county_id") %>%
+  mutate(
+    treat_year = ifelse(is.na(first_treat) | first_treat == 0, 0, first_treat)
+  ) %>%
+  filter(
+    !is.na(gfr_nonint), !is.na(year), !is.na(county_id), !is.na(treat_year),
+    !is.na(gfr_trend_pre), !is.na(gfr_pre_mean),
+    !is.na(pct59incge10k), !is.na(pct59inclt3k),
+    !is.na(pct60nonwhit), !is.na(pct60rurf), !is.na(pct60urban),
+    !is.na(pct60mt64years), !is.na(pct60lt5years),
+    !is.na(ln_60totpop), !is.na(pct60educge12yr), !is.na(pct60educlt4yr),
+    !is.na(region_factor)
+  ) %>%
+  as.data.frame()
+```
+
+### Callaway and Sant'Anna (2021) estimator
+
+```{r att-main}
+att_main <- att_gt(
+  yname = "gfr_nonint",
+  tname = "year",
+  idname = "county_id",
+  gname = "treat_year",
+  xformla = ~ gfr_trend_pre + gfr_pre_mean +
+    pct59incge10k + pct59inclt3k +
+    pct60nonwhit + pct60rurf + pct60urban +
+    pct60mt64years + pct60lt5years +
+    ln_60totpop + pct60educge12yr + pct60educlt4yr +
+    region_factor,
+  data = did_panel,
+  control_group = "notyettreated",
+  est_method = "dr",
+  base_period = "universal",
+  bstrap = TRUE,
+  clustervars = "county_id"
+)
+
+es_main <- aggte(att_main, type = "dynamic", min_e = -6, max_e = 15, na.rm = TRUE)
+agg_simple <- aggte(att_main, type = "simple")
+agg_group <- aggte(att_main, type = "group")
+```
+
+### Robustness estimators: Sun and Abraham (2021) and stacked event study
+
+```{r robustness-estimators}
+# robust alternatives
+sa_panel <- did_panel %>%
+  mutate(cohort = treat_year)
+
+est_sa <- feols(
+  gfr_nonint ~ sunab(cohort, year) | county_id + year,
+  data = sa_panel,
+  cluster = ~ county_id
+)
+
+stack_base <- bind_rows(stack_weights_list) %>%
+  mutate(stack_id = paste0(county_id, "_", stack_wave))
+
+stack_panel <- df %>%
+  inner_join(
+    stack_base %>%
+      select(county_id, stack_wave, stack_id, treated_stack, ipw_weight_gbm),
+    by = "county_id",
+    relationship = "many-to-many"
+  ) %>%
+  mutate(rel_time = year - stack_wave) %>%
+  filter(rel_time >= -6, rel_time <= 15)
+
+est_stack_es <- feols(
+  gfr_nonint ~ i(rel_time, treated_stack, ref = -1) |
+    stack_id + stack_wave^year,
+  data = stack_panel,
+  weights = ~ ipw_weight_gbm,
+  cluster = ~ county_id
+)
+```
+
+## 5. Tables
+
+### Table A: Balance diagnostics
+
+```{r table-balance}
+tbl_balance_compare <- left_join(
+  never_balance_summary %>%
+    transmute(
+      `Policy wave` = wave_label,
+      `Max absolute SMD before weighting` = round(max_abs_smd_unadj, 3),
+      `Max absolute SMD after weighting (never-treated controls)` = round(max_abs_smd_adj, 3),
+      `Covariates with |SMD| > 0.10 (never-treated controls)` = n_bad_010_adj
+    ),
+  balance_summary_nyt %>%
+    transmute(
+      `Policy wave` = wave_label,
+      `Max absolute SMD after weighting (not-yet-treated controls)` = round(max_abs_smd, 3),
+      `Mean absolute SMD after weighting (not-yet-treated controls)` = round(mean_abs_smd, 3),
+      `Covariates with |SMD| > 0.10 (not-yet-treated controls)` = n_bad_010,
+      `Covariates with |SMD| > 0.25 (not-yet-treated controls)` = n_bad_025
+    ),
+  by = "Policy wave"
+)
+
+write_csv(tbl_balance_compare, "report_outputs/csv/table_balance_comparison.csv")
+
+kable(tbl_balance_compare, digits = 3, caption = "Balance diagnostics comparing never-treated and not-yet-treated control groups.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Table B: Average treatment effects by wave
+
+```{r table-att-by-wave}
+tbl_att <- tibble(
+  `Treatment cohort` = as.character(agg_group$egt), # Keep all years as exact years
+  `ATT` = round(agg_group$att.egt, 3),
+  `Std. Error` = round(agg_group$se.egt, 3),
+  `95% CI lower` = round(agg_group$att.egt - 1.96 * agg_group$se.egt, 3),
+  `95% CI upper` = round(agg_group$att.egt + 1.96 * agg_group$se.egt, 3)
+) %>%
+  # Optionally, add a new column to show which wave they belong to
+  mutate(`Policy Wave` = case_when(
+    `Treatment cohort` %in% c("1965", "1966", "1967") ~ "Wave 1",
+    `Treatment cohort` %in% c("1968", "1969") ~ "Wave 2",
+    `Treatment cohort` %in% c("1970", "1971", "1972", "1973") ~ "Wave 3"
+  )) %>%
+  select(`Policy Wave`, `Treatment cohort`, everything()) # Reorder columns
+
+write_csv(tbl_att, "report_outputs/csv/table_att_by_wave.csv")
+
+kable(tbl_att, digits = 3, caption = "Average treatment effects by treatment wave from the Callaway and Sant’Anna estimator.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+### Table C: Pre-treatment coefficients
+
+```{r table-pretrend}
+event_study_tbl <- tibble(
+  event_time = es_main$egt,
+  estimate = es_main$att.egt,
+  se = es_main$se.egt
+) %>%
+  mutate(
+    ci_low = estimate - 1.96 * se,
+    ci_high = estimate + 1.96 * se,
+    significant = ifelse(sign(ci_low) == sign(ci_high), "Yes", "No")
+  )
+
+pretrend_tbl <- event_study_tbl %>%
+  filter(event_time < 0) %>%
+  transmute(
+    `Event time` = event_time,
+    `Estimate` = round(estimate, 3),
+    `Std. Error` = round(se, 3),
+    `95% CI lower` = round(ci_low, 3),
+    `95% CI upper` = round(ci_high, 3),
+    `Significant at 5%` = significant
+  )
+
+write_csv(event_study_tbl, "report_outputs/csv/table_event_study_main.csv")
+write_csv(pretrend_tbl, "report_outputs/csv/table_pretrend_main.csv")
+
+kable(pretrend_tbl, digits = 3, caption = "Pre-treatment event-study coefficients used to assess no anticipation and parallel trends.") %>%
+  kable_styling(full_width = FALSE)
+```
+
+## 6. Figures
+
+### Figure 1: Love plots (not-yet-treated controls)
+
+```{r fig-loveplots-not-yet-treated}
+for (g in waves) {
+  p <- love.plot(
+    stack_bal_objects[[as.character(g)]],
+    threshold = 0.1,
+    abs = TRUE,
+    un = TRUE,
+    binary = "std",
+    stats = "mean.diffs",
+    var.order = "unadjusted",
+    title = wave_labels[as.character(g)],
+    colors = c("grey55", "#2166AC"),
+    shapes = c(16, 17),
+    sample.names = c("Before weighting", "After GBM weighting"),
+    var.names = var_labels
+  ) +
+    labs(
+      x = "Absolute standardized mean difference",
+      y = NULL,
+      caption = "Control group: not-yet-treated counties. Dashed line marks |SMD| = 0.10."
+    ) +
+    theme_report()
+
+  print(p)
+
+  ggsave(
+    paste0("report_outputs/figures/loveplot_notyettreated_", g, ".png"),
+    plot = p, width = 9, height = 6, dpi = 300
+  )
+}
+```
+
+### Figure 2: Love plots (never-treated controls)
+
+```{r fig-loveplots-never-treated}
+for (g in waves) {
+  p <- love.plot(
+    never_bal_objects[[as.character(g)]],
+    threshold = 0.1,
+    abs = TRUE,
+    un = TRUE,
+    binary = "std",
+    stats = "mean.diffs",
+    var.order = "unadjusted",
+    title = paste0(wave_labels[as.character(g)], " — Never-treated controls"),
+    colors = c("grey55", "#D6604D"),
+    shapes = c(16, 17),
+    sample.names = c("Before weighting", "After GBM weighting"),
+    var.names = var_labels
+  ) +
+    labs(
+      x = "Absolute standardized mean difference",
+      y = NULL,
+      caption = "Control group: never-treated counties only. Dashed line marks |SMD| = 0.10."
+    ) +
+    theme_report()
+
+  print(p)
+
+  ggsave(
+    paste0("report_outputs/figures/loveplot_nevertreated_", g, ".png"),
+    plot = p, width = 9, height = 6, dpi = 300
+  )
+}
+```
+
+### Figure 3: Overlap
+
+```{r fig-overlap, fig.height = 7}
+overlap_plot_df <- bind_rows(stack_weights_list) %>%
+  mutate(
+    Group = ifelse(treated_stack == 1, "Treated counties", "Control counties"),
+    wave_label = factor(wave_labels[as.character(stack_wave)], levels = unname(wave_labels))
+  )
+
+fig_overlap <- ggplot(overlap_plot_df, aes(x = ps_init, fill = Group, color = Group)) +
+  geom_density(alpha = 0.30, linewidth = 0.7) +
+  facet_wrap(~ wave_label, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = c("Control counties" = "grey55", "Treated counties" = "#2166AC")) +
+  scale_color_manual(values = c("Control counties" = "grey55", "Treated counties" = "#2166AC")) +
+  labs(
+    title = "Propensity score overlap by policy wave",
+    subtitle = "Generalized boosted model propensity scores before trimming",
+    x = "Estimated probability of treatment",
+    y = "Density",
+    fill = NULL,
+    color = NULL,
+    caption = "Control group includes not-yet-treated counties."
+  ) +
+  theme_report()
+
+print(fig_overlap)
+ggsave("report_outputs/figures/overlap_notyettreated.png", fig_overlap, width = 9, height = 7, dpi = 300)
+```
+
+### Figure 4: Main event study
+
+```{r fig-event-study}
+fig_event <- ggplot(event_study_tbl, aes(x = event_time, y = estimate)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_vline(xintercept = -0.5, linetype = "dotted", color = "grey40", linewidth = 0.4) +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), fill = "#BDD7E7", alpha = 0.6) +
+  geom_line(color = "#2166AC", linewidth = 0.8) +
+  geom_point(size = 2, color = "#2166AC") +
+  labs(
+    title = "Dynamic treatment effects of federally funded family planning programs",
+    subtitle = "Callaway and Sant’Anna (2021), not-yet-treated controls, doubly robust estimator",
+    x = "Years relative to first treatment",
+    y = "Average treatment effect on the treated\n(births per 1,000 women aged 15–44)",
+    caption = "Shaded area shows 95% pointwise confidence intervals."
+  ) +
+  theme_report()
+
+print(fig_event)
+ggsave("report_outputs/figures/event_study_main.png", fig_event, width = 9, height = 6, dpi = 300)
+```
+
+### Figure 5: Pretrend placebo
+
+```{r fig-pretrend-placebo}
+fig_pre <- ggplot(pretrend_tbl, aes(x = `Event time`, y = `Estimate`)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_errorbar(aes(ymin = `95% CI lower`, ymax = `95% CI upper`), width = 0.2, color = "#2166AC") +
+  geom_line(color = "#2166AC", linewidth = 0.8) +
+  geom_point(color = "#2166AC", size = 2) +
+  labs(
+    title = "Pre-treatment placebo test",
+    subtitle = "Callaway and Sant’Anna pre-treatment coefficients",
+    x = "Years before first treatment",
+    y = "Estimated placebo effect\n(births per 1,000 women aged 15–44)",
+    caption = "Under no anticipation and parallel trends, coefficients should be close to zero."
+  ) +
+  theme_report()
+
+print(fig_pre)
+ggsave("report_outputs/figures/pretrend_placebo.png", fig_pre, width = 8, height = 5.5, dpi = 300)
+```
+
+### Figure 6: Robustness event-study comparison
+
+```{r fig-robustness}
+sa_coef <- broom::tidy(est_sa) %>%
+  filter(str_detect(term, "year::")) %>%
+  mutate(
+    event_time = as.numeric(str_extract(term, "-?[0-9]+")),
+    ci_low = estimate - 1.96 * std.error,
+    ci_high = estimate + 1.96 * std.error,
+    method = "Sun and Abraham (2021)"
+  ) %>%
+  select(event_time, estimate, ci_low, ci_high, method)
+
+stack_coef <- tibble(
+  term = names(coef(est_stack_es)),
+  estimate = as.numeric(coef(est_stack_es)),
+  se = as.numeric(se(est_stack_es))
+) %>%
+  filter(str_detect(term, "rel_time::")) %>%
+  mutate(
+    event_time = as.numeric(str_extract(term, "-?[0-9]+")),
+    ci_low = estimate - 1.96 * se,
+    ci_high = estimate + 1.96 * se,
+    method = "Stacked weighted event study"
+  ) %>%
+  select(event_time, estimate, ci_low, ci_high, method) %>%
+  bind_rows(tibble(
+    event_time = -1,
+    estimate = 0,
+    ci_low = 0,
+    ci_high = 0,
+    method = "Stacked weighted event study"
+  ))
+
+cs_coef <- event_study_tbl %>%
+  mutate(method = "Callaway and Sant’Anna (2021)") %>%
+  select(event_time, estimate, ci_low, ci_high, method)
+
+robust_df <- bind_rows(cs_coef, sa_coef, stack_coef) %>%
+  filter(event_time >= -6, event_time <= 15)
+
+write_csv(robust_df, "report_outputs/csv/table_event_study_robustness.csv")
+
+fig_robust <- ggplot(robust_df, aes(x = event_time, y = estimate, color = method, fill = method)) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+  geom_vline(xintercept = -0.5, linetype = "dotted", color = "grey40", linewidth = 0.4) +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.12, color = NA) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.6) +
+  scale_color_manual(values = c(
+    "Callaway and Sant’Anna (2021)" = "#2166AC",
+    "Sun and Abraham (2021)" = "#D6604D",
+    "Stacked weighted event study" = "#4DAC26"
+  )) +
+  scale_fill_manual(values = c(
+    "Callaway and Sant’Anna (2021)" = "#BDD7E7",
+    "Sun and Abraham (2021)" = "#FDDBC7",
+    "Stacked weighted event study" = "#B8E186"
+  )) +
+  labs(
+    title = "Robustness of dynamic treatment effects across estimators",
+    subtitle = "Comparison of three estimators designed for staggered treatment timing",
+    x = "Years relative to first treatment",
+    y = "Estimated effect on fertility\n(births per 1,000 women aged 15–44)",
+    color = NULL,
+    fill = NULL
+  ) +
+  theme_report()
+
+print(fig_robust)
+ggsave("report_outputs/figures/event_study_robustness.png", fig_robust, width = 9, height = 6, dpi = 300)
+```
+
+## 7. Outputs
+
+Tables are saved to `report_outputs/csv/` and figures to `report_outputs/figures/`.
